@@ -1,0 +1,56 @@
+import { NextResponse } from "next/server";
+import { sql } from "@/lib/db";
+
+export const dynamic = "force-dynamic";
+
+export async function GET() {
+  try {
+    const [employees, locations, projects, shifts, entries, leaves] =
+      await Promise.all([
+        sql`
+          SELECT e.*, s.name AS shift_name, s.start_time, s.end_time, s.grace_minutes, s.work_hours_target
+          FROM employees e
+          LEFT JOIN shifts s ON e.shift_id = s.id
+          WHERE e.is_active = TRUE
+          ORDER BY e.id ASC
+        `,
+        sql`SELECT * FROM locations ORDER BY id ASC`,
+        sql`SELECT * FROM projects WHERE is_active = TRUE ORDER BY id ASC`,
+        sql`SELECT * FROM shifts ORDER BY id ASC`,
+        sql`
+          SELECT t.*, e.full_name, e.emp_code, e.department, e.hourly_rate,
+                 p.name AS project_name, l.name AS location_name
+          FROM time_entries t
+          JOIN employees e ON t.employee_id = e.id
+          LEFT JOIN projects p ON t.project_id = p.id
+          LEFT JOIN locations l ON t.location_id = l.id
+          WHERE t.punched_at >= NOW() - INTERVAL '35 days'
+          ORDER BY t.punched_at DESC
+        `,
+        sql`
+          SELECT lr.*, e.full_name, e.emp_code, e.department
+          FROM leave_requests lr
+          JOIN employees e ON lr.employee_id = e.id
+          ORDER BY lr.created_at DESC
+          LIMIT 100
+        `,
+      ]);
+
+    return NextResponse.json({
+      ok: true,
+      serverTime: new Date().toISOString(),
+      employees,
+      locations,
+      projects,
+      shifts,
+      entries,
+      leaves,
+    });
+  } catch (error: any) {
+    console.error("Bootstrap Error:", error);
+    return NextResponse.json(
+      { ok: false, error: error.message || "Gagal memuat data server" },
+      { status: 500 }
+    );
+  }
+}
