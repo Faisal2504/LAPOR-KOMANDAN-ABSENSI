@@ -1,14 +1,14 @@
-import type { Metadata, Viewport } from "next";
 import "./globals.css";
+import type { Metadata, Viewport } from "next";
 
 export const metadata: Metadata = {
-  title: "JibblePro — Absensi GPS, Selfie, Kiosk & Offline",
-  description: "Aplikasi absensi online & offline lengkap bergaya Jibble 2",
+  title: "Jibble — Dasbor & Absensi GPS Offline",
+  description: "Aplikasi Absensi Karyawan Online & Offline GPS Selfie Kiosk",
   manifest: "/manifest.json",
 };
 
 export const viewport: Viewport = {
-  themeColor: "#ff6b00",
+  themeColor: "#ffffff",
   width: "device-width",
   initialScale: 1,
   maximumScale: 1,
@@ -22,9 +22,12 @@ export default function RootLayout({
   return (
     <html lang="id">
       <head>
-        <link rel="apple-touch-icon" href="https://cdn-icons-png.flaticon.com/512/2991/2991148.png" />
+        <link
+          rel="apple-touch-icon"
+          href="https://cdn-icons-png.flaticon.com/512/2991/2991148.png"
+        />
       </head>
-      <body>
+      <body className="bg-[#F5F6F8] text-slate-900 antialiased">
         {children}
         <script
           dangerouslySetInnerHTML={{
