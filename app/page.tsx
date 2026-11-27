@@ -21,6 +21,8 @@ import {
   MonitorSmartphone,
   Settings,
   ArrowLeft,
+  QrCode,
+  Upload,
 } from "lucide-react";
 
 interface Employee {
@@ -33,6 +35,15 @@ interface Employee {
   hourly_rate: number;
   shift_id: number | null;
   work_hours_target?: number;
+  shift_name?: string;
+  shift_start_time?: string;
+}
+
+interface ShiftPreset {
+  id: number;
+  name: string;
+  startTime: string; // HH:mm (WIB)
+  targetHours: number;
 }
 
 interface LocationItem {
@@ -105,12 +116,33 @@ interface TimesheetRow {
   approvalStatus: "PENDING" | "APPROVED" | "REJECTED";
 }
 
+interface ImportedEmployeeScheduleRow {
+  emp_code: string;
+  full_name: string;
+  role: "ADMIN" | "MANAGER" | "STAFF";
+  department: string;
+  pin_code: string;
+  hourly_rate: number;
+  shift_id: number;
+  shift_name: string;
+  shift_start_time: string;
+  schedule_date?: string;
+}
+
 type MainTab = "beranda" | "timeclock" | "timesheet" | "persetujuan" | "menu";
 type SubView = "none" | "whosin" | "kiosk" | "admin";
+
+const SHIFT_PRESETS: ShiftPreset[] = [
+  { id: 1, name: "Shift Pagi", startTime: "07:00", targetHours: 8 },
+  { id: 2, name: "Shift Siang", startTime: "15:00", targetHours: 8 },
+  { id: 3, name: "Shift Malam", startTime: "23:00", targetHours: 8 },
+];
 
 const CACHE_KEY = "jibblepro_master_cache_v2";
 const QUEUE_KEY = "jibblepro_offline_queue_v2";
 const ACTIVE_EMP_KEY = "jibblepro_active_emp_id_v2";
+const QR_CODE_KEY = "jibblepro_office_qr_v2";
+const SHIFT_ASSIGN_KEY = "jibblepro_shift_assignments_v1";
 
 const getJakartaDateStr = (iso: string) =>
   new Date(iso).toLocaleDateString("en-CA", { timeZone: "Asia/Jakarta" });
@@ -150,6 +182,142 @@ function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number)
   return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
 
+function resolveShiftPreset(input?: string | number | null): ShiftPreset {
+  if (typeof input === "number") {
+    return SHIFT_PRESETS.find((s) => s.id === input) || SHIFT_PRESETS[0];
+  }
+  const raw = String(input || "").trim().toLowerCase();
+  if (raw === "2" || raw.includes("siang") || raw.includes("15:00") || raw.includes("15.00")) {
+    return SHIFT_PRESETS[1];
+  }
+  if (raw === "3" || raw.includes("malam") || raw.includes("23:00") || raw.includes("23.00")) {
+    return SHIFT_PRESETS[2];
+  }
+  return SHIFT_PRESETS[0];
+}
+
+function calcLateFromShift(punchedIso: string, shiftStartTime: string) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Jakarta",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  })
+    .format(new Date(punchedIso))
+    .split(":");
+  const actualMin = Number(parts[0]) * 60 + Number(parts[1]);
+  const normStart = shiftStartTime.replace(".", ":");
+  const [sh, sm] = normStart.split(":").map(Number);
+  const startMin = (isNaN(sh) ? 7 : sh) * 60 + (isNaN(sm) ? 0 : sm);
+  const diff = actualMin - startMin;
+  if (diff > 0) {
+    return { isLate: true, lateMinutes: diff };
+  }
+  return { isLate: false, lateMinutes: 0 };
+}
+
+function parseRowsToImportItems(rawRows: Record<string, unknown>[]): ImportedEmployeeScheduleRow[] {
+  const results: ImportedEmployeeScheduleRow[] = [];
+  rawRows.forEach((row, idx) => {
+    const normalized: Record<string, string> = {};
+    for (const [k, v] of Object.entries(row)) {
+      normalized[k.trim().toLowerCase().replace(/[^a-z0-9_]/g, "_")] =
+        v == null ? "" : String(v).trim();
+    }
+
+    const fullName =
+      normalized.full_name ||
+      normalized.nama_lengkap ||
+      normalized.nama ||
+      normalized.karyawan ||
+      "";
+    const empCode =
+      normalized.emp_code ||
+      normalized.id_karyawan ||
+      normalized.nip ||
+      normalized.kode ||
+      (fullName ? `KRY-${String(idx + 1).padStart(3, "0")}` : "");
+
+    if (!fullName && !empCode) return;
+
+    const shiftRaw =
+      normalized.shift ||
+      normalized.shift_name ||
+      normalized.jadwal ||
+      normalized.shift_id ||
+      normalized.jam_masuk ||
+      "1";
+    const preset = resolveShiftPreset(shiftRaw);
+
+    const roleRaw = (normalized.role || normalized.jabatan || "STAFF").toUpperCase();
+    const role: "ADMIN" | "MANAGER" | "STAFF" =
+      roleRaw.includes("ADMIN") ? "ADMIN" : roleRaw.includes("MAN") ? "MANAGER" : "STAFF";
+
+    const pinRaw = (normalized.pin_code || normalized.pin || "1234").replace(/\D/g, "").slice(0, 4);
+    const rateRaw = Number((normalized.hourly_rate || normalized.upah || "25000").replace(/\D/g, ""));
+
+    results.push({
+      emp_code: empCode,
+      full_name: fullName || empCode,
+      role,
+      department: normalized.department || normalized.departemen || normalized.divisi || "Operasional",
+      pin_code: pinRaw.length === 4 ? pinRaw : "1234",
+      hourly_rate: rateRaw > 0 ? rateRaw : 25000,
+      shift_id: preset.id,
+      shift_name: preset.name,
+      shift_start_time: preset.startTime,
+      schedule_date: normalized.tanggal || normalized.date || normalized.jadwal_tanggal || undefined,
+    });
+  });
+  return results;
+}
+
+function parsePdfLinesToImportItems(lines: string[]): ImportedEmployeeScheduleRow[] {
+  const items: ImportedEmployeeScheduleRow[] = [];
+  lines.forEach((line, idx) => {
+    const clean = line.replace(/\s+/g, " ").trim();
+    if (!clean) return;
+    const lower = clean.toLowerCase();
+    if (
+      lower.startsWith("jadwal") ||
+      lower.startsWith("daftar") ||
+      (lower.includes("nama") && lower.includes("shift"))
+    ) {
+      return;
+    }
+
+    const codeMatch = clean.match(/\b([A-Z]{2,5}[-_]\d{2,5})\b/i);
+    const preset = resolveShiftPreset(clean);
+    const dateMatch = clean.match(/\b(\d{4}-\d{2}-\d{2}|\d{2}[/-]\d{2}[/-]\d{4})\b/);
+
+    let namePart = clean;
+    if (codeMatch) namePart = namePart.replace(codeMatch[0], " ");
+    namePart = namePart
+      .replace(/shift\s*(pagi|siang|malam|1|2|3)/gi, " ")
+      .replace(/\b(07[:.]00|15[:.]00|23[:.]00)\b/g, " ")
+      .replace(/\b(\d{4}-\d{2}-\d{2}|\d{2}[/-]\d{2}[/-]\d{4})\b/g, " ")
+      .replace(/[|•–—-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!namePart && !codeMatch) return;
+
+    items.push({
+      emp_code: codeMatch ? codeMatch[1].toUpperCase() : `PDF-${String(idx + 1).padStart(3, "0")}`,
+      full_name: namePart || `Karyawan ${idx + 1}`,
+      role: "STAFF",
+      department: "Operasional",
+      pin_code: "1234",
+      hourly_rate: 25000,
+      shift_id: preset.id,
+      shift_name: preset.name,
+      shift_start_time: preset.startTime,
+      schedule_date: dateMatch ? dateMatch[1] : undefined,
+    });
+  });
+  return items;
+}
+
 export default function JibbleDashboardApp() {
   const [mainTab, setMainTab] = useState<MainTab>("beranda");
   const [subView, setSubView] = useState<SubView>("none");
@@ -170,11 +338,17 @@ export default function JibbleDashboardApp() {
   const [serverEntries, setServerEntries] = useState<TimeEntry[]>([]);
   const [offlineQueue, setOfflineQueue] = useState<TimeEntry[]>([]);
   const [leaves, setLeaves] = useState<LeaveRequest[]>([]);
+  const [shiftMap, setShiftMap] = useState<Record<number, number>>({});
 
   const [selectedEmpId, setSelectedEmpId] = useState<number>(1);
   const [selectedProjectId, setSelectedProjectId] = useState<number>(1);
   const [selectedActivity, setSelectedActivity] = useState("Kerja Reguler");
   const [punchNotes, setPunchNotes] = useState("");
+
+  const [officeQrCode, setOfficeQrCode] = useState("ABSENSI-KANTOR-MPI-BTG");
+  const [qrInput, setQrInput] = useState("");
+  const [qrScanActive, setQrScanActive] = useState(false);
+  const qrVideoRef = useRef<HTMLVideoElement | null>(null);
 
   const [gpsCoords, setGpsCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [gpsStatus, setGpsStatus] = useState("Mencari titik GPS...");
@@ -215,6 +389,11 @@ export default function JibbleDashboardApp() {
     reason: "",
   });
 
+  const [importRows, setImportRows] = useState<ImportedEmployeeScheduleRow[]>([]);
+  const [importStatus, setImportStatus] = useState<string>("");
+  const [isImporting, setIsImporting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
   const showToast = useCallback((type: "ok" | "warn" | "err", text: string) => {
     setToast({ type, text });
     setTimeout(() => setToast(null), 3500);
@@ -242,6 +421,10 @@ export default function JibbleDashboardApp() {
 
   useEffect(() => {
     try {
+      const savedQr = localStorage.getItem(QR_CODE_KEY);
+      if (savedQr) setOfficeQrCode(savedQr);
+      const savedShifts = localStorage.getItem(SHIFT_ASSIGN_KEY);
+      if (savedShifts) setShiftMap(JSON.parse(savedShifts));
       const savedEmp = localStorage.getItem(ACTIVE_EMP_KEY);
       if (savedEmp) setSelectedEmpId(Number(savedEmp));
       const rawQ = localStorage.getItem(QUEUE_KEY);
@@ -323,6 +506,20 @@ export default function JibbleDashboardApp() {
     fetchBootstrapData();
   }, [fetchBootstrapData, isOnline]);
 
+  const enrichedEmployees = useMemo<Employee[]>(() => {
+    return employees.map((emp) => {
+      const assignedShiftId = shiftMap[emp.id] ?? emp.shift_id ?? 1;
+      const preset = resolveShiftPreset(assignedShiftId);
+      return {
+        ...emp,
+        shift_id: preset.id,
+        shift_name: preset.name,
+        shift_start_time: preset.startTime,
+        work_hours_target: emp.work_hours_target || preset.targetHours,
+      };
+    });
+  }, [employees, shiftMap]);
+
   const refreshGPS = useCallback(() => {
     if (!("geolocation" in navigator)) {
       setGpsStatus("GPS tidak didukung");
@@ -342,6 +539,56 @@ export default function JibbleDashboardApp() {
   useEffect(() => {
     refreshGPS();
   }, [refreshGPS]);
+
+  const stopQrScanner = useCallback(() => {
+    if (qrVideoRef.current?.srcObject) {
+      (qrVideoRef.current.srcObject as MediaStream)
+        .getTracks()
+        .forEach((t) => t.stop());
+      qrVideoRef.current.srcObject = null;
+    }
+    setQrScanActive(false);
+  }, []);
+
+  const startQrScanner = async () => {
+    try {
+      setQrScanActive(true);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" },
+        audio: false,
+      });
+      if (qrVideoRef.current) qrVideoRef.current.srcObject = stream;
+      const BD = (
+        window as unknown as {
+          BarcodeDetector?: new (opts: { formats: string[] }) => {
+            detect: (v: HTMLVideoElement) => Promise<{ rawValue: string }[]>;
+          };
+        }
+      ).BarcodeDetector;
+      if (BD) {
+        const detector = new BD({ formats: ["qr_code"] });
+        const tick = async () => {
+          if (!qrVideoRef.current || !qrVideoRef.current.srcObject) return;
+          try {
+            const codes = await detector.detect(qrVideoRef.current);
+            if (codes.length > 0 && codes[0].rawValue) {
+              setQrInput(codes[0].rawValue);
+              stopQrScanner();
+              showToast("ok", "QR Kantor terbaca! Silakan tekan tombol absen.");
+              return;
+            }
+          } catch {
+            // Lanjutkan frame berikutnya
+          }
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      }
+    } catch {
+      setQrScanActive(false);
+      showToast("warn", "Kamera QR diblokir, silakan ketik kode QR manual.");
+    }
+  };
 
   const startCamera = async () => {
     try {
@@ -385,7 +632,7 @@ export default function JibbleDashboardApp() {
     const localOnly = offlineQueue
       .filter((q) => !ids.has(q.client_uuid))
       .map((q) => {
-        const emp = employees.find((e) => Number(e.id) === Number(q.employee_id));
+        const emp = enrichedEmployees.find((e) => Number(e.id) === Number(q.employee_id));
         const proj = projects.find((p) => Number(p.id) === Number(q.project_id));
         return {
           ...q,
@@ -399,7 +646,7 @@ export default function JibbleDashboardApp() {
     return [...localOnly, ...serverEntries].sort(
       (a, b) => new Date(b.punched_at).getTime() - new Date(a.punched_at).getTime()
     );
-  }, [serverEntries, offlineQueue, employees, projects]);
+  }, [serverEntries, offlineQueue, enrichedEmployees, projects]);
 
   const nearestGeofence = useMemo(() => {
     if (!gpsCoords || locations.length === 0) return null;
@@ -493,7 +740,7 @@ export default function JibbleDashboardApp() {
         }
       }
 
-      const emp = employees.find((e) => Number(e.id) === Number(empId));
+      const emp = enrichedEmployees.find((e) => Number(e.id) === Number(empId));
       const targetSec = Number(emp?.work_hours_target || 8) * 3600;
       return {
         status,
@@ -503,16 +750,37 @@ export default function JibbleDashboardApp() {
         entries: list,
       };
     },
-    [allEntries, todayStr, nowTick, employees]
+    [allEntries, todayStr, nowTick, enrichedEmployees]
   );
 
   const activeEmployee = useMemo(
-    () => employees.find((e) => Number(e.id) === Number(selectedEmpId)) || employees[0],
-    [employees, selectedEmpId]
+    () =>
+      enrichedEmployees.find((e) => Number(e.id) === Number(selectedEmpId)) ||
+      enrichedEmployees[0],
+    [enrichedEmployees, selectedEmpId]
   );
 
   const isAdmin =
     activeEmployee?.role === "ADMIN" || activeEmployee?.role === "MANAGER";
+
+  const settings = useMemo(
+    () => ({
+      office_name:
+        nearestGeofence?.location.name ||
+        locations[0]?.name ||
+        "Kantor Utama MPI-BTG",
+      qr_code: officeQrCode,
+      radius_meters:
+        nearestGeofence?.location.radius_meters ||
+        locations[0]?.radius_meters ||
+        150,
+    }),
+    [nearestGeofence, locations, officeQrCode]
+  );
+
+  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(
+    settings.qr_code
+  )}`;
 
   const activeEmpToday = useMemo(
     () => (activeEmployee ? computeDayStats(activeEmployee.id, todayStr) : null),
@@ -522,7 +790,7 @@ export default function JibbleDashboardApp() {
   const whoIsInOutCounts = useMemo(() => {
     const scopeEmps =
       viewScope === "Organisasi"
-        ? employees
+        ? enrichedEmployees
         : activeEmployee
         ? [activeEmployee]
         : [];
@@ -536,7 +804,7 @@ export default function JibbleDashboardApp() {
       else keluar++;
     }
     return { masuk, istirahat, keluar };
-  }, [employees, viewScope, activeEmployee, computeDayStats, todayStr]);
+  }, [enrichedEmployees, viewScope, activeEmployee, computeDayStats, todayStr]);
 
   const weeklyChartData = useMemo(() => {
     const dayLabels = ["S", "S", "R", "K", "J", "S", "M"];
@@ -548,7 +816,7 @@ export default function JibbleDashboardApp() {
     monday.setDate(jNow.getDate() + (jsDay === 0 ? -6 : 1 - jsDay));
     const scopeEmps =
       viewScope === "Organisasi"
-        ? employees
+        ? enrichedEmployees
         : activeEmployee
         ? [activeEmployee]
         : [];
@@ -606,7 +874,7 @@ export default function JibbleDashboardApp() {
   }, [
     nowTick,
     viewScope,
-    employees,
+    enrichedEmployees,
     activeEmployee,
     computeDayStats,
     todayStr,
@@ -618,17 +886,31 @@ export default function JibbleDashboardApp() {
     entryType: "CLOCK_IN" | "BREAK_START" | "BREAK_END" | "CLOCK_OUT",
     isKiosk = false
   ) => {
-    const targetEmp = employees.find((e) => Number(e.id) === Number(targetEmpId));
+    const targetEmp = enrichedEmployees.find(
+      (e) => Number(e.id) === Number(targetEmpId)
+    );
     const targetIsAdmin =
       targetEmp?.role === "ADMIN" || targetEmp?.role === "MANAGER";
 
-    if (!isKiosk && !targetIsAdmin && nearestGeofence && !nearestGeofence.inside) {
-      showToast(
-        "err",
-        `Di luar radius lokasi (${nearestGeofence.distance}m > ${nearestGeofence.location.radius_meters}m).`
-      );
-      return;
+    if (!isKiosk && !targetIsAdmin) {
+      if (qrInput.trim().toUpperCase() !== settings.qr_code.trim().toUpperCase()) {
+        showToast("err", "Scan atau masukkan kode QR resmi kantor terlebih dahulu!");
+        return;
+      }
+      if (nearestGeofence && !nearestGeofence.inside) {
+        showToast(
+          "err",
+          `Di luar radius lokasi (${nearestGeofence.distance}m > ${nearestGeofence.location.radius_meters}m).`
+        );
+        return;
+      }
     }
+
+    const punchedIso = new Date().toISOString();
+    const lateInfo =
+      entryType === "CLOCK_IN"
+        ? calcLateFromShift(punchedIso, targetEmp?.shift_start_time || "07:00")
+        : { isLate: false, lateMinutes: 0 };
 
     const selfieImg = cameraActive ? capturePhoto() : capturedSelfie;
     const uuid =
@@ -640,7 +922,7 @@ export default function JibbleDashboardApp() {
       client_uuid: uuid,
       employee_id: Number(targetEmpId),
       entry_type: entryType,
-      punched_at: new Date().toISOString(),
+      punched_at: punchedIso,
       is_offline_sync: !navigator.onLine,
       project_id: selectedProjectId || null,
       activity_name: selectedActivity,
@@ -650,7 +932,11 @@ export default function JibbleDashboardApp() {
       distance_meters: nearestGeofence?.distance ?? null,
       is_within_geofence: nearestGeofence ? nearestGeofence.inside : true,
       selfie_data: selfieImg || null,
-      notes: isKiosk ? `[KIOSK] ${punchNotes}` : punchNotes,
+      notes: isKiosk
+        ? `[KIOSK - ${targetEmp?.shift_name || "Shift Pagi"}] ${punchNotes}`
+        : `[${targetEmp?.shift_name || "Shift Pagi"}] ${punchNotes}`.trim(),
+      is_late: lateInfo.isLate,
+      late_minutes: lateInfo.lateMinutes,
     };
 
     const nextQ = [payload, ...offlineQueue];
@@ -658,6 +944,8 @@ export default function JibbleDashboardApp() {
     localStorage.setItem(QUEUE_KEY, JSON.stringify(nextQ));
     setCapturedSelfie(null);
     setPunchNotes("");
+    setQrInput("");
+    stopQrScanner();
 
     if (navigator.onLine) {
       await syncOfflineQueueToServer(nextQ);
@@ -693,12 +981,20 @@ export default function JibbleDashboardApp() {
       const lastOut = [...sorted].reverse().find((i) => i.entry_type === "CLOCK_OUT");
       const empId = Number(sorted[0].employee_id);
       const dStr = key.split("__")[1];
-      const emp = employees.find((e) => Number(e.id) === empId);
+      const emp = enrichedEmployees.find((e) => Number(e.id) === empId);
       const st = computeDayStats(empId, dStr);
       const targetH = Number(emp?.work_hours_target || 8);
       const totalH = st.workSeconds / 3600;
       const otH = Math.max(0, totalH - targetH);
       const rate = Number(emp?.hourly_rate || 25000);
+
+      const fallbackLate =
+        firstIn && firstIn.is_late === undefined
+          ? calcLateFromShift(firstIn.punched_at, emp?.shift_start_time || "07:00")
+          : {
+              isLate: Boolean(firstIn?.is_late),
+              lateMinutes: Number(firstIn?.late_minutes || 0),
+            };
 
       rows.push({
         key,
@@ -708,8 +1004,8 @@ export default function JibbleDashboardApp() {
         clockIn: firstIn?.punched_at || null,
         clockOut: lastOut?.punched_at || null,
         projectName: firstIn?.project_name || "-",
-        isLate: Boolean(firstIn?.is_late),
-        lateMinutes: Number(firstIn?.late_minutes || 0),
+        isLate: fallbackLate.isLate,
+        lateMinutes: fallbackLate.lateMinutes,
         workSeconds: st.workSeconds,
         breakSeconds: st.breakSeconds,
         overtimeHours: otH.toFixed(2),
@@ -720,7 +1016,7 @@ export default function JibbleDashboardApp() {
       });
     });
     return rows;
-  }, [allEntries, filterDate, filterEmpId, employees, computeDayStats]);
+  }, [allEntries, filterDate, filterEmpId, enrichedEmployees, computeDayStats]);
 
   const exportExcel = () => {
     const headers = [
@@ -782,12 +1078,174 @@ export default function JibbleDashboardApp() {
     }
   };
 
+  const handleAssignShift = async (emp: Employee, nextShiftId: number) => {
+    const preset = resolveShiftPreset(nextShiftId);
+    const updatedMap = { ...shiftMap, [emp.id]: preset.id };
+    setShiftMap(updatedMap);
+    localStorage.setItem(SHIFT_ASSIGN_KEY, JSON.stringify(updatedMap));
+
+    if (navigator.onLine) {
+      try {
+        await fetch("/api/manage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "SAVE_EMPLOYEE",
+            payload: {
+              ...emp,
+              shift_id: preset.id,
+              work_hours_target: preset.targetHours,
+            },
+          }),
+        });
+        await fetchBootstrapData();
+      } catch {
+        // Tetap tersimpan lokal bila endpoint belum mendukung field shift_id
+      }
+    }
+    showToast("ok", `${emp.full_name} diatur ke ${preset.name} (${preset.startTime})`);
+  };
+
+  const handleImportFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setIsImporting(true);
+    setImportStatus(`Membaca ${file.name}...`);
+    setImportRows([]);
+
+    try {
+      const lowerName = file.name.toLowerCase();
+      if (lowerName.endsWith(".xlsx") || lowerName.endsWith(".xls") || lowerName.endsWith(".csv")) {
+        const XLSX = await import("xlsx");
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf, { type: "array" });
+        const firstSheet = wb.SheetNames[0];
+        const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(
+          wb.Sheets[firstSheet],
+          { defval: "" }
+        );
+        const parsed = parseRowsToImportItems(rows);
+        setImportRows(parsed);
+        setImportStatus(
+          parsed.length > 0
+            ? `Ditemukan ${parsed.length} baris karyawan & jadwal dari ${file.name}.`
+            : `Tidak ada baris valid ditemukan di ${file.name}.`
+        );
+      } else if (lowerName.endsWith(".pdf")) {
+        const pdfjsLib = await import("pdfjs-dist");
+        if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
+          pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+        }
+        const buf = new Uint8Array(await file.arrayBuffer());
+        const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+        const collectedLines: string[] = [];
+
+        for (let p = 1; p <= doc.numPages; p++) {
+          const page = await doc.getPage(p);
+          const content = await page.getTextContent();
+          const lineMap = new Map<number, string[]>();
+          for (const item of content.items) {
+            if ("str" in item && "transform" in item && item.str.trim()) {
+              const yKey = Math.round(item.transform[5] / 4) * 4;
+              if (!lineMap.has(yKey)) lineMap.set(yKey, []);
+              lineMap.get(yKey)!.push(item.str.trim());
+            }
+          }
+          const sortedY = Array.from(lineMap.keys()).sort((a, b) => b - a);
+          for (const y of sortedY) {
+            collectedLines.push(lineMap.get(y)!.join(" "));
+          }
+        }
+
+        const parsed = parsePdfLinesToImportItems(collectedLines);
+        setImportRows(parsed);
+        setImportStatus(
+          parsed.length > 0
+            ? `Ditemukan ${parsed.length} baris karyawan & jadwal dari PDF (${doc.numPages} halaman).`
+            : "Teks PDF terbaca, tetapi belum ada baris jadwal yang cocok. Periksa format nama & shift (Pagi/Siang/Malam atau 07:00/15:00/23:00)."
+        );
+      } else {
+        setImportStatus("Format tidak didukung. Gunakan file .xlsx, .xls, .csv, atau .pdf.");
+      }
+    } catch (err) {
+      setImportStatus(
+        `Gagal membaca file: ${err instanceof Error ? err.message : "Error tidak diketahui"}`
+      );
+    } finally {
+      setIsImporting(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const applyImportedRows = async () => {
+    if (importRows.length === 0) return;
+    setIsImporting(true);
+    let savedCount = 0;
+    const nextShiftMap = { ...shiftMap };
+
+    try {
+      for (const row of importRows) {
+        const existing = enrichedEmployees.find(
+          (emp) =>
+            emp.emp_code.trim().toLowerCase() === row.emp_code.trim().toLowerCase() ||
+            emp.full_name.trim().toLowerCase() === row.full_name.trim().toLowerCase()
+        );
+
+        const targetId = existing?.id;
+        if (targetId) {
+          nextShiftMap[targetId] = row.shift_id;
+        }
+
+        if (navigator.onLine) {
+          const res = await fetch("/api/manage", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              action: "SAVE_EMPLOYEE",
+              payload: {
+                id: existing?.id || 0,
+                emp_code: existing?.emp_code || row.emp_code,
+                full_name: row.full_name,
+                role: existing?.role || row.role,
+                department: row.department || existing?.department || "Operasional",
+                pin_code: existing?.pin_code || row.pin_code,
+                hourly_rate: existing?.hourly_rate || row.hourly_rate,
+                shift_id: row.shift_id,
+                work_hours_target: 8,
+              },
+            }),
+          });
+          const data = await res.json();
+          if (data.ok) {
+            savedCount++;
+            if (data.employee?.id) {
+              nextShiftMap[Number(data.employee.id)] = row.shift_id;
+            }
+          }
+        } else {
+          savedCount++;
+        }
+      }
+
+      setShiftMap(nextShiftMap);
+      localStorage.setItem(SHIFT_ASSIGN_KEY, JSON.stringify(nextShiftMap));
+      if (navigator.onLine) {
+        await fetchBootstrapData();
+      }
+      showToast("ok", `${savedCount} data karyawan & jadwal shift berhasil diproses!`);
+      setImportRows([]);
+      setImportStatus(`Selesai memproses ${savedCount} baris.`);
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
   const handleKioskDigit = (d: string) => {
     if (kioskPin.length >= 4) return;
     const next = kioskPin + d;
     setKioskPin(next);
     if (next.length === 4) {
-      const found = employees.find((e) => e.pin_code === next);
+      const found = enrichedEmployees.find((e) => e.pin_code === next);
       if (found) {
         setKioskEmployee(found);
         startCamera();
@@ -838,6 +1296,7 @@ export default function JibbleDashboardApp() {
             <button
               onClick={() => {
                 stopCamera();
+                stopQrScanner();
                 setSubView("none");
               }}
               className="p-1.5 -ml-1.5 rounded-full text-slate-700"
@@ -880,7 +1339,7 @@ export default function JibbleDashboardApp() {
               </button>
             </div>
             <div className="space-y-2 max-h-60 overflow-y-auto">
-              {employees.map((emp) => (
+              {enrichedEmployees.map((emp) => (
                 <button
                   key={emp.id}
                   onClick={() => {
@@ -897,7 +1356,7 @@ export default function JibbleDashboardApp() {
                   <div>
                     <div className="font-bold text-sm">{emp.full_name}</div>
                     <div className="text-xs text-slate-500">
-                      {emp.emp_code} • {emp.role}
+                      {emp.emp_code} • {emp.role} • {emp.shift_name} ({emp.shift_start_time})
                     </div>
                   </div>
                   {Number(selectedEmpId) === Number(emp.id) && (
@@ -1091,7 +1550,7 @@ export default function JibbleDashboardApp() {
 
       {subView === "whosin" && (
         <div className="p-4 space-y-3">
-          {employees.map((emp) => {
+          {enrichedEmployees.map((emp) => {
             const st = computeDayStats(emp.id, todayStr);
             const firstIn = st.entries.find((e) => e.entry_type === "CLOCK_IN");
             return (
@@ -1114,7 +1573,7 @@ export default function JibbleDashboardApp() {
                   <div>
                     <div className="font-bold text-sm">{emp.full_name}</div>
                     <div className="text-xs text-slate-500">
-                      {emp.department} •{" "}
+                      {emp.department} • {emp.shift_name} ({emp.shift_start_time}) •{" "}
                       {firstIn
                         ? `Masuk ${formatTimeWIB(firstIn.punched_at)}`
                         : "Belum masuk"}
@@ -1151,7 +1610,8 @@ export default function JibbleDashboardApp() {
               <div className="flex items-center justify-between text-left border-b border-slate-100 pb-3">
                 <div>
                   <div className="text-xs text-slate-400 font-semibold">
-                    {activeEmployee.emp_code} • {activeEmployee.department}
+                    {activeEmployee.emp_code} • {activeEmployee.shift_name} (Masuk{" "}
+                    {activeEmployee.shift_start_time})
                   </div>
                   <div className="font-bold text-base">
                     {activeEmployee.full_name}
@@ -1173,12 +1633,14 @@ export default function JibbleDashboardApp() {
                     : "KELUAR"}
                 </span>
               </div>
+
               <div>
                 <div className="text-xs text-slate-400">Durasi Hari Ini</div>
                 <div className="text-4xl font-mono font-extrabold mt-1">
                   {formatDuration(activeEmpToday.workSeconds)}
                 </div>
               </div>
+
               <div className="grid grid-cols-2 gap-2 text-left">
                 <select
                   value={selectedProjectId}
@@ -1201,6 +1663,7 @@ export default function JibbleDashboardApp() {
                   <option value="Lembur">Lembur</option>
                 </select>
               </div>
+
               <div className="bg-slate-50 rounded-xl p-3 flex items-center justify-between text-left text-xs border border-slate-100">
                 <div className="flex items-center gap-2">
                   <MapPin
@@ -1226,6 +1689,48 @@ export default function JibbleDashboardApp() {
                   Cek GPS
                 </button>
               </div>
+
+              <div className="text-left space-y-2 bg-slate-50 rounded-xl p-3 border border-slate-100">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-slate-600 flex items-center gap-1">
+                    <QrCode className="w-3.5 h-3.5 text-emerald-600" /> Scan QR Kantor
+                  </span>
+                  {!qrScanActive ? (
+                    <button
+                      onClick={startQrScanner}
+                      className="text-xs font-bold text-emerald-700"
+                    >
+                      Buka Kamera QR
+                    </button>
+                  ) : (
+                    <button
+                      onClick={stopQrScanner}
+                      className="px-2.5 py-1 rounded-lg bg-rose-600 text-white text-xs font-bold"
+                    >
+                      Tutup QR
+                    </button>
+                  )}
+                </div>
+                {qrScanActive && (
+                  <div className="w-44 h-44 mx-auto rounded-2xl overflow-hidden bg-black border-2 border-emerald-500">
+                    <video
+                      ref={qrVideoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      className="w-full h-full object-cover"
+                    />
+                  </div>
+                )}
+                <input
+                  type="text"
+                  placeholder="Scan QR atau masukkan kode QR resmi kantor..."
+                  value={qrInput}
+                  onChange={(e) => setQrInput(e.target.value)}
+                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs bg-white"
+                />
+              </div>
+
               <div className="text-left">
                 <div className="flex items-center justify-between mb-1.5">
                   <span className="text-xs font-semibold text-slate-600 flex items-center gap-1">
@@ -1267,6 +1772,7 @@ export default function JibbleDashboardApp() {
                 )}
                 <canvas ref={canvasRef} className="hidden" />
               </div>
+
               <input
                 type="text"
                 placeholder="Catatan opsional..."
@@ -1274,6 +1780,7 @@ export default function JibbleDashboardApp() {
                 onChange={(e) => setPunchNotes(e.target.value)}
                 className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs"
               />
+
               <div className="grid grid-cols-2 gap-2.5">
                 {activeEmpToday.status === "OUT" && (
                   <button
@@ -1327,6 +1834,63 @@ export default function JibbleDashboardApp() {
                 )}
               </div>
             </div>
+
+            {isAdmin && (
+              <div
+                className="card bg-white rounded-2xl p-5 border border-slate-100"
+                style={{ textAlign: "center" }}
+              >
+                <strong>QR Code Resmi ({settings.office_name})</strong>
+                <p style={{ fontSize: 12, color: "#64748b" }}>
+                  Radius GPS: Maks. {settings.radius_meters} meter
+                </p>
+                <img
+                  src={qrUrl}
+                  alt="QR Kantor"
+                  style={{
+                    width: 200,
+                    height: 200,
+                    border: "1px solid #e2e8f0",
+                    borderRadius: 12,
+                    padding: 8,
+                    margin: "0 auto",
+                  }}
+                />
+                <div style={{ fontWeight: 800, marginTop: 8 }}>
+                  {settings.qr_code}
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    gap: 8,
+                    justifyContent: "center",
+                    marginTop: 12,
+                  }}
+                >
+                  <a
+                    href={qrUrl}
+                    download={`${settings.qr_code}.png`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="btn px-4 py-2 rounded-xl text-xs font-bold"
+                    style={{
+                      background: "#047857",
+                      color: "#fff",
+                      textDecoration: "none",
+                    }}
+                  >
+                    Download PNG
+                  </a>
+                  <button
+                    className="btn px-4 py-2 rounded-xl text-xs font-bold"
+                    style={{ background: "#0f172a", color: "#fff" }}
+                    onClick={() => window.print()}
+                  >
+                    Cetak QR
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -1354,7 +1918,7 @@ export default function JibbleDashboardApp() {
                 className="flex-1 rounded-xl border px-3 py-1.5 text-xs"
               >
                 <option value="ALL">Semua Karyawan</option>
-                {employees.map((e) => (
+                {enrichedEmployees.map((e) => (
                   <option key={e.id} value={e.id}>
                     {e.full_name}
                   </option>
@@ -1544,10 +2108,10 @@ export default function JibbleDashboardApp() {
                 <Settings className="w-5 h-5 text-slate-700" />
                 <div>
                   <div className="font-bold text-sm">
-                    Pengaturan Admin & Lokasi GPS
+                    Pengaturan Admin, Shift & Import Massal
                   </div>
                   <div className="text-xs text-slate-500">
-                    Kelola karyawan, PIN & titik geofence
+                    Shift Pagi/Siang/Malam, Import PDF/XLSX, QR & GPS
                   </div>
                 </div>
               </div>
@@ -1615,6 +2179,9 @@ export default function JibbleDashboardApp() {
                 <div className="font-bold text-orange-400 text-lg">
                   {kioskEmployee.full_name}
                 </div>
+                <div className="text-xs text-slate-300">
+                  {kioskEmployee.shift_name} • Masuk {kioskEmployee.shift_start_time}
+                </div>
                 <div className="w-36 h-36 mx-auto rounded-2xl overflow-hidden bg-black border-2 border-orange-500">
                   <video
                     ref={videoRef}
@@ -1661,6 +2228,102 @@ export default function JibbleDashboardApp() {
 
       {subView === "admin" && isAdmin && (
         <div className="p-4 space-y-4">
+          <div className="bg-white rounded-2xl p-4 border border-slate-100 space-y-3">
+            <h3 className="font-bold text-sm">Jadwal Shift Resmi (WIB)</h3>
+            <div className="grid grid-cols-3 gap-2 text-center">
+              {SHIFT_PRESETS.map((sp) => (
+                <div
+                  key={sp.id}
+                  className="p-2.5 rounded-xl bg-slate-50 border border-slate-200/80"
+                >
+                  <div className="text-xs font-bold text-slate-800">{sp.name}</div>
+                  <div className="text-sm font-mono font-extrabold text-[#00C805] mt-0.5">
+                    {sp.startTime}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="bg-white rounded-2xl p-4 border border-slate-100 space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold text-sm">
+                Import Massal Karyawan & Jadwal (.xlsx / .pdf)
+              </h3>
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isImporting}
+                className="px-3 py-1.5 rounded-xl bg-emerald-600 text-white text-xs font-bold flex items-center gap-1.5"
+              >
+                <Upload className="w-3.5 h-3.5" />
+                {isImporting ? "Memproses..." : "Pilih File PDF / XLSX"}
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".xlsx,.xls,.csv,.pdf"
+                onChange={handleImportFileChange}
+                className="hidden"
+              />
+            </div>
+            <p className="text-[11px] text-slate-500">
+              Kolom Excel/CSV yang didukung: <b>emp_code / id_karyawan</b>,{" "}
+              <b>full_name / nama</b>, <b>department</b>, <b>pin_code</b>,{" "}
+              <b>shift</b> (Shift Pagi 07:00, Shift Siang 15:00, Shift Malam 23:00).
+            </p>
+            {importStatus && (
+              <div className="text-xs font-medium text-slate-700 bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                {importStatus}
+              </div>
+            )}
+            {importRows.length > 0 && (
+              <div className="space-y-2">
+                <div className="max-h-48 overflow-y-auto space-y-1.5">
+                  {importRows.map((item, idx) => (
+                    <div
+                      key={`${item.emp_code}-${idx}`}
+                      className="p-2.5 rounded-xl bg-amber-50/70 border border-amber-200/70 flex items-center justify-between text-xs"
+                    >
+                      <div>
+                        <span className="font-bold">{item.full_name}</span>{" "}
+                        <span className="text-slate-500">({item.emp_code})</span>
+                        <div className="text-[11px] text-slate-600">
+                          {item.department} • PIN: {item.pin_code}
+                          {item.schedule_date ? ` • Tgl: ${item.schedule_date}` : ""}
+                        </div>
+                      </div>
+                      <span className="px-2 py-0.5 rounded-full bg-white border font-bold text-[11px] text-emerald-700">
+                        {item.shift_name} ({item.shift_start_time})
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <button
+                  onClick={applyImportedRows}
+                  disabled={isImporting}
+                  className="w-full py-2.5 rounded-xl bg-[#FF6B00] text-white font-bold text-xs"
+                >
+                  Simpan {importRows.length} Karyawan & Jadwal ke Sistem
+                </button>
+              </div>
+            )}
+          </div>
+
+          <div className="bg-white rounded-2xl p-4 border border-slate-100 space-y-3">
+            <h3 className="font-bold text-sm">Kode QR Resmi Kantor</h3>
+            <div className="flex gap-2">
+              <input
+                placeholder="Kode QR Kantor (contoh: ABSENSI-KANTOR-MPI-BTG)"
+                value={officeQrCode}
+                onChange={(e) => {
+                  setOfficeQrCode(e.target.value);
+                  localStorage.setItem(QR_CODE_KEY, e.target.value);
+                }}
+                className="flex-1 rounded-xl border px-3 py-1.5 text-xs"
+              />
+            </div>
+          </div>
+
           <div className="bg-white rounded-2xl p-4 border border-slate-100 space-y-3">
             <div className="flex justify-between items-center">
               <h3 className="font-bold text-sm">Lokasi GPS & Radius</h3>
@@ -1752,7 +2415,7 @@ export default function JibbleDashboardApp() {
           </div>
 
           <div className="bg-white rounded-2xl p-4 border border-slate-100 space-y-3">
-            <h3 className="font-bold text-sm">Karyawan & PIN Kios</h3>
+            <h3 className="font-bold text-sm">Karyawan, Shift & PIN Kios</h3>
             <div className="grid grid-cols-2 gap-2">
               <input
                 placeholder="ID (KRY-003)"
@@ -1779,10 +2442,30 @@ export default function JibbleDashboardApp() {
                 }
                 className="rounded-xl border px-3 py-1.5 text-xs"
               />
+              <select
+                value={newEmp.shift_id}
+                onChange={(e) =>
+                  setNewEmp({ ...newEmp, shift_id: e.target.value })
+                }
+                className="rounded-xl border px-3 py-1.5 text-xs bg-white"
+              >
+                <option value="1">Shift Pagi (07:00)</option>
+                <option value="2">Shift Siang (15:00)</option>
+                <option value="3">Shift Malam (23:00)</option>
+              </select>
               <button
                 onClick={() => {
                   if (!newEmp.emp_code || !newEmp.full_name) return;
-                  callManageApi("SAVE_EMPLOYEE", newEmp, "Ditambahkan!");
+                  const preset = resolveShiftPreset(Number(newEmp.shift_id));
+                  callManageApi(
+                    "SAVE_EMPLOYEE",
+                    {
+                      ...newEmp,
+                      shift_id: preset.id,
+                      work_hours_target: preset.targetHours,
+                    },
+                    "Ditambahkan!"
+                  );
                   setNewEmp({
                     id: 0,
                     emp_code: "",
@@ -1794,30 +2477,43 @@ export default function JibbleDashboardApp() {
                     shift_id: "1",
                   });
                 }}
-                className="rounded-xl bg-orange-500 text-white font-bold text-xs"
+                className="col-span-2 py-2 rounded-xl bg-orange-500 text-white font-bold text-xs"
               >
-                + Tambah
+                + Tambah Karyawan
               </button>
             </div>
-            {employees.map((e) => (
+            {enrichedEmployees.map((e) => (
               <div
                 key={e.id}
-                className="p-2.5 rounded-xl bg-slate-50 flex justify-between items-center text-xs"
+                className="p-2.5 rounded-xl bg-slate-50 flex flex-wrap gap-2 justify-between items-center text-xs"
               >
                 <div>
                   <span className="font-bold">{e.full_name}</span> ({e.emp_code}
                   ) • PIN: {e.pin_code}
                 </div>
-                {e.role !== "ADMIN" && (
-                  <button
-                    onClick={() =>
-                      callManageApi("DELETE_EMPLOYEE", { id: e.id }, "Dihapus")
+                <div className="flex items-center gap-2">
+                  <select
+                    value={e.shift_id || 1}
+                    onChange={(ev) =>
+                      handleAssignShift(e, Number(ev.target.value))
                     }
-                    className="text-rose-600 font-bold"
+                    className="rounded-lg border bg-white px-2 py-1 text-[11px] font-semibold"
                   >
-                    Hapus
-                  </button>
-                )}
+                    <option value={1}>Shift Pagi (07:00)</option>
+                    <option value={2}>Shift Siang (15:00)</option>
+                    <option value={3}>Shift Malam (23:00)</option>
+                  </select>
+                  {e.role !== "ADMIN" && (
+                    <button
+                      onClick={() =>
+                        callManageApi("DELETE_EMPLOYEE", { id: e.id }, "Dihapus")
+                      }
+                      className="text-rose-600 font-bold"
+                    >
+                      Hapus
+                    </button>
+                  )}
+                </div>
               </div>
             ))}
           </div>
@@ -1839,6 +2535,7 @@ export default function JibbleDashboardApp() {
               key={item.id}
               onClick={() => {
                 stopCamera();
+                stopQrScanner();
                 setSubView("none");
                 setMainTab(item.id as MainTab);
               }}
