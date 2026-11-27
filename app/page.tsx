@@ -42,7 +42,7 @@ interface Employee {
 interface ShiftPreset {
   id: number;
   name: string;
-  startTime: string; // HH:mm (WIB)
+  startTime: string;
   targetHours: number;
 }
 
@@ -187,10 +187,20 @@ function resolveShiftPreset(input?: string | number | null): ShiftPreset {
     return SHIFT_PRESETS.find((s) => s.id === input) || SHIFT_PRESETS[0];
   }
   const raw = String(input || "").trim().toLowerCase();
-  if (raw === "2" || raw.includes("siang") || raw.includes("15:00") || raw.includes("15.00")) {
+  if (
+    raw === "2" ||
+    raw.includes("siang") ||
+    raw.includes("15:00") ||
+    raw.includes("15.00")
+  ) {
     return SHIFT_PRESETS[1];
   }
-  if (raw === "3" || raw.includes("malam") || raw.includes("23:00") || raw.includes("23.00")) {
+  if (
+    raw === "3" ||
+    raw.includes("malam") ||
+    raw.includes("23:00") ||
+    raw.includes("23.00")
+  ) {
     return SHIFT_PRESETS[2];
   }
   return SHIFT_PRESETS[0];
@@ -216,60 +226,106 @@ function calcLateFromShift(punchedIso: string, shiftStartTime: string) {
   return { isLate: false, lateMinutes: 0 };
 }
 
-function parseRowsToImportItems(rawRows: Record<string, unknown>[]): ImportedEmployeeScheduleRow[] {
-  const results: ImportedEmployeeScheduleRow[] = [];
-  rawRows.forEach((row, idx) => {
-    const normalized: Record<string, string> = {};
-    for (const [k, v] of Object.entries(row)) {
-      normalized[k.trim().toLowerCase().replace(/[^a-z0-9_]/g, "_")] =
-        v == null ? "" : String(v).trim();
+function splitCsvLine(line: string, delimiter: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+    } else if (ch === delimiter && !inQuotes) {
+      out.push(cur.trim());
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur.trim());
+  return out;
+}
+
+function parseDelimitedTextToItems(text: string): ImportedEmployeeScheduleRow[] {
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return [];
+
+  const delimiter = lines[0].includes(";") ? ";" : ",";
+  const headers = splitCsvLine(lines[0], delimiter).map((h) =>
+    h.toLowerCase().replace(/[^a-z0-9_]/g, "_")
+  );
+  const hasHeader = headers.some((h) =>
+    ["nama", "full_name", "emp_code", "id_karyawan", "shift", "pin"].includes(h)
+  );
+
+  const dataLines = hasHeader ? lines.slice(1) : lines;
+  const rows: ImportedEmployeeScheduleRow[] = [];
+
+  dataLines.forEach((line, idx) => {
+    const cols = splitCsvLine(line, delimiter);
+    const map: Record<string, string> = {};
+    if (hasHeader) {
+      headers.forEach((h, i) => {
+        if (h) map[h] = cols[i] ?? "";
+      });
+    } else {
+      map.emp_code = cols[0] ?? "";
+      map.full_name = cols[1] ?? "";
+      map.shift = cols[2] ?? "1";
+      map.department = cols[3] ?? "Operasional";
+      map.pin_code = cols[4] ?? "1234";
     }
 
     const fullName =
-      normalized.full_name ||
-      normalized.nama_lengkap ||
-      normalized.nama ||
-      normalized.karyawan ||
-      "";
+      map.full_name || map.nama_lengkap || map.nama || map.karyawan || "";
     const empCode =
-      normalized.emp_code ||
-      normalized.id_karyawan ||
-      normalized.nip ||
-      normalized.kode ||
+      map.emp_code ||
+      map.id_karyawan ||
+      map.nip ||
+      map.kode ||
       (fullName ? `KRY-${String(idx + 1).padStart(3, "0")}` : "");
-
     if (!fullName && !empCode) return;
 
     const shiftRaw =
-      normalized.shift ||
-      normalized.shift_name ||
-      normalized.jadwal ||
-      normalized.shift_id ||
-      normalized.jam_masuk ||
-      "1";
+      map.shift ||
+      map.shift_name ||
+      map.jadwal ||
+      map.shift_id ||
+      map.jam_masuk ||
+      line;
     const preset = resolveShiftPreset(shiftRaw);
 
-    const roleRaw = (normalized.role || normalized.jabatan || "STAFF").toUpperCase();
-    const role: "ADMIN" | "MANAGER" | "STAFF" =
-      roleRaw.includes("ADMIN") ? "ADMIN" : roleRaw.includes("MAN") ? "MANAGER" : "STAFF";
+    const roleRaw = (map.role || map.jabatan || "STAFF").toUpperCase();
+    const role: "ADMIN" | "MANAGER" | "STAFF" = roleRaw.includes("ADMIN")
+      ? "ADMIN"
+      : roleRaw.includes("MAN")
+      ? "MANAGER"
+      : "STAFF";
 
-    const pinRaw = (normalized.pin_code || normalized.pin || "1234").replace(/\D/g, "").slice(0, 4);
-    const rateRaw = Number((normalized.hourly_rate || normalized.upah || "25000").replace(/\D/g, ""));
+    const pinRaw = (map.pin_code || map.pin || "1234")
+      .replace(/\D/g, "")
+      .slice(0, 4);
+    const rateRaw = Number(
+      (map.hourly_rate || map.upah || "25000").replace(/\D/g, "")
+    );
 
-    results.push({
+    rows.push({
       emp_code: empCode,
       full_name: fullName || empCode,
       role,
-      department: normalized.department || normalized.departemen || normalized.divisi || "Operasional",
+      department: map.department || map.departemen || "Operasional",
       pin_code: pinRaw.length === 4 ? pinRaw : "1234",
       hourly_rate: rateRaw > 0 ? rateRaw : 25000,
       shift_id: preset.id,
       shift_name: preset.name,
       shift_start_time: preset.startTime,
-      schedule_date: normalized.tanggal || normalized.date || normalized.jadwal_tanggal || undefined,
+      schedule_date: map.tanggal || map.date || undefined,
     });
   });
-  return results;
+
+  return rows;
 }
 
 function parsePdfLinesToImportItems(lines: string[]): ImportedEmployeeScheduleRow[] {
@@ -288,7 +344,9 @@ function parsePdfLinesToImportItems(lines: string[]): ImportedEmployeeScheduleRo
 
     const codeMatch = clean.match(/\b([A-Z]{2,5}[-_]\d{2,5})\b/i);
     const preset = resolveShiftPreset(clean);
-    const dateMatch = clean.match(/\b(\d{4}-\d{2}-\d{2}|\d{2}[/-]\d{2}[/-]\d{4})\b/);
+    const dateMatch = clean.match(
+      /\b(\d{4}-\d{2}-\d{2}|\d{2}[/-]\d{2}[/-]\d{4})\b/
+    );
 
     let namePart = clean;
     if (codeMatch) namePart = namePart.replace(codeMatch[0], " ");
@@ -303,7 +361,9 @@ function parsePdfLinesToImportItems(lines: string[]): ImportedEmployeeScheduleRo
     if (!namePart && !codeMatch) return;
 
     items.push({
-      emp_code: codeMatch ? codeMatch[1].toUpperCase() : `PDF-${String(idx + 1).padStart(3, "0")}`,
+      emp_code: codeMatch
+        ? codeMatch[1].toUpperCase()
+        : `PDF-${String(idx + 1).padStart(3, "0")}`,
       full_name: namePart || `Karyawan ${idx + 1}`,
       role: "STAFF",
       department: "Operasional",
@@ -318,6 +378,23 @@ function parsePdfLinesToImportItems(lines: string[]): ImportedEmployeeScheduleRo
   return items;
 }
 
+function extractReadableLinesFromPdfBytes(bytes: Uint8Array): string[] {
+  const raw = new TextDecoder("latin1").decode(bytes);
+  const chunks: string[] = [];
+  const parenMatches = raw.match(/\(([^()\\]{2,120})\)/g) || [];
+  for (const m of parenMatches) {
+    const inner = m
+      .slice(1, -1)
+      .replace(/\\([()\\])/g, "$1")
+      .replace(/[^\x20-\x7E]/g, " ")
+      .trim();
+    if (inner.length >= 2 && /[a-zA-Z0-9]/.test(inner)) {
+      chunks.push(inner);
+    }
+  }
+  return chunks;
+}
+
 export default function JibbleDashboardApp() {
   const [mainTab, setMainTab] = useState<MainTab>("beranda");
   const [subView, setSubView] = useState<SubView>("none");
@@ -328,9 +405,10 @@ export default function JibbleDashboardApp() {
   const [isOnline, setIsOnline] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
   const [nowTick, setNowTick] = useState(() => new Date());
-  const [toast, setToast] = useState<{ type: "ok" | "warn" | "err"; text: string } | null>(
-    null
-  );
+  const [toast, setToast] = useState<{
+    type: "ok" | "warn" | "err";
+    text: string;
+  } | null>(null);
 
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [locations, setLocations] = useState<LocationItem[]>([]);
@@ -350,7 +428,9 @@ export default function JibbleDashboardApp() {
   const [qrScanActive, setQrScanActive] = useState(false);
   const qrVideoRef = useRef<HTMLVideoElement | null>(null);
 
-  const [gpsCoords, setGpsCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [gpsCoords, setGpsCoords] = useState<{ lat: number; lng: number } | null>(
+    null
+  );
   const [gpsStatus, setGpsStatus] = useState("Mencari titik GPS...");
   const [cameraActive, setCameraActive] = useState(false);
   const [capturedSelfie, setCapturedSelfie] = useState<string | null>(null);
@@ -394,10 +474,13 @@ export default function JibbleDashboardApp() {
   const [isImporting, setIsImporting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const showToast = useCallback((type: "ok" | "warn" | "err", text: string) => {
-    setToast({ type, text });
-    setTimeout(() => setToast(null), 3500);
-  }, []);
+  const showToast = useCallback(
+    (type: "ok" | "warn" | "err", text: string) => {
+      setToast({ type, text });
+      setTimeout(() => setToast(null), 3500);
+    },
+    []
+  );
 
   useEffect(() => {
     setIsOnline(typeof navigator !== "undefined" ? navigator.onLine : true);
@@ -595,7 +678,11 @@ export default function JibbleDashboardApp() {
       setCapturedSelfie(null);
       setCameraActive(true);
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user", width: { ideal: 480 }, height: { ideal: 480 } },
+        video: {
+          facingMode: "user",
+          width: { ideal: 480 },
+          height: { ideal: 480 },
+        },
         audio: false,
       });
       if (videoRef.current) videoRef.current.srcObject = stream;
@@ -607,7 +694,9 @@ export default function JibbleDashboardApp() {
 
   const stopCamera = () => {
     if (videoRef.current?.srcObject) {
-      (videoRef.current.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+      (videoRef.current.srcObject as MediaStream)
+        .getTracks()
+        .forEach((t) => t.stop());
       videoRef.current.srcObject = null;
     }
     setCameraActive(false);
@@ -632,7 +721,9 @@ export default function JibbleDashboardApp() {
     const localOnly = offlineQueue
       .filter((q) => !ids.has(q.client_uuid))
       .map((q) => {
-        const emp = enrichedEmployees.find((e) => Number(e.id) === Number(q.employee_id));
+        const emp = enrichedEmployees.find(
+          (e) => Number(e.id) === Number(q.employee_id)
+        );
         const proj = projects.find((p) => Number(p.id) === Number(q.project_id));
         return {
           ...q,
@@ -687,7 +778,8 @@ export default function JibbleDashboardApp() {
             getJakartaDateStr(e.punched_at) === targetDate
         )
         .sort(
-          (a, b) => new Date(a.punched_at).getTime() - new Date(b.punched_at).getTime()
+          (a, b) =>
+            new Date(a.punched_at).getTime() - new Date(b.punched_at).getTime()
         );
       if (list.length === 0) {
         return {
@@ -893,8 +985,13 @@ export default function JibbleDashboardApp() {
       targetEmp?.role === "ADMIN" || targetEmp?.role === "MANAGER";
 
     if (!isKiosk && !targetIsAdmin) {
-      if (qrInput.trim().toUpperCase() !== settings.qr_code.trim().toUpperCase()) {
-        showToast("err", "Scan atau masukkan kode QR resmi kantor terlebih dahulu!");
+      if (
+        qrInput.trim().toUpperCase() !== settings.qr_code.trim().toUpperCase()
+      ) {
+        showToast(
+          "err",
+          "Scan atau masukkan kode QR resmi kantor terlebih dahulu!"
+        );
         return;
       }
       if (nearestGeofence && !nearestGeofence.inside) {
@@ -966,7 +1063,8 @@ export default function JibbleDashboardApp() {
     for (const e of allEntries) {
       const dStr = getJakartaDateStr(e.punched_at);
       if (filterDate && dStr !== filterDate) continue;
-      if (filterEmpId !== "ALL" && String(e.employee_id) !== filterEmpId) continue;
+      if (filterEmpId !== "ALL" && String(e.employee_id) !== filterEmpId)
+        continue;
       const k = `${e.employee_id}__${dStr}`;
       if (!grouped.has(k)) grouped.set(k, []);
       grouped.get(k)!.push(e);
@@ -975,10 +1073,13 @@ export default function JibbleDashboardApp() {
     const rows: TimesheetRow[] = [];
     grouped.forEach((items, key) => {
       const sorted = [...items].sort(
-        (a, b) => new Date(a.punched_at).getTime() - new Date(b.punched_at).getTime()
+        (a, b) =>
+          new Date(a.punched_at).getTime() - new Date(b.punched_at).getTime()
       );
       const firstIn = sorted.find((i) => i.entry_type === "CLOCK_IN");
-      const lastOut = [...sorted].reverse().find((i) => i.entry_type === "CLOCK_OUT");
+      const lastOut = [...sorted]
+        .reverse()
+        .find((i) => i.entry_type === "CLOCK_OUT");
       const empId = Number(sorted[0].employee_id);
       const dStr = key.split("__")[1];
       const emp = enrichedEmployees.find((e) => Number(e.id) === empId);
@@ -990,7 +1091,10 @@ export default function JibbleDashboardApp() {
 
       const fallbackLate =
         firstIn && firstIn.is_late === undefined
-          ? calcLateFromShift(firstIn.punched_at, emp?.shift_start_time || "07:00")
+          ? calcLateFromShift(
+              firstIn.punched_at,
+              emp?.shift_start_time || "07:00"
+            )
           : {
               isLate: Boolean(firstIn?.is_late),
               lateMinutes: Number(firstIn?.late_minutes || 0),
@@ -1103,10 +1207,15 @@ export default function JibbleDashboardApp() {
         // Tetap tersimpan lokal bila endpoint belum mendukung field shift_id
       }
     }
-    showToast("ok", `${emp.full_name} diatur ke ${preset.name} (${preset.startTime})`);
+    showToast(
+      "ok",
+      `${emp.full_name} diatur ke ${preset.name} (${preset.startTime})`
+    );
   };
 
-  const handleImportFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImportFileChange = async (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setIsImporting(true);
@@ -1115,61 +1224,38 @@ export default function JibbleDashboardApp() {
 
     try {
       const lowerName = file.name.toLowerCase();
-      if (lowerName.endsWith(".xlsx") || lowerName.endsWith(".xls") || lowerName.endsWith(".csv")) {
-        const XLSX = await import("xlsx");
-        const buf = await file.arrayBuffer();
-        const wb = XLSX.read(buf, { type: "array" });
-        const firstSheet = wb.SheetNames[0];
-        const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(
-          wb.Sheets[firstSheet],
-          { defval: "" }
-        );
-        const parsed = parseRowsToImportItems(rows);
+      if (
+        lowerName.endsWith(".csv") ||
+        lowerName.endsWith(".txt") ||
+        lowerName.endsWith(".xlsx") ||
+        lowerName.endsWith(".xls")
+      ) {
+        const text = await file.text();
+        const parsed = parseDelimitedTextToItems(text);
         setImportRows(parsed);
         setImportStatus(
           parsed.length > 0
             ? `Ditemukan ${parsed.length} baris karyawan & jadwal dari ${file.name}.`
-            : `Tidak ada baris valid ditemukan di ${file.name}.`
+            : `Tidak ada baris CSV/teks valid pada ${file.name}. Simpan file Excel sebagai CSV (.csv) jika format biner.`
         );
       } else if (lowerName.endsWith(".pdf")) {
-        const pdfjsLib = await import("pdfjs-dist");
-        if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-          pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
-        }
-        const buf = new Uint8Array(await file.arrayBuffer());
-        const doc = await pdfjsLib.getDocument({ data: buf }).promise;
-        const collectedLines: string[] = [];
-
-        for (let p = 1; p <= doc.numPages; p++) {
-          const page = await doc.getPage(p);
-          const content = await page.getTextContent();
-          const lineMap = new Map<number, string[]>();
-          for (const item of content.items) {
-            if ("str" in item && "transform" in item && item.str.trim()) {
-              const yKey = Math.round(item.transform[5] / 4) * 4;
-              if (!lineMap.has(yKey)) lineMap.set(yKey, []);
-              lineMap.get(yKey)!.push(item.str.trim());
-            }
-          }
-          const sortedY = Array.from(lineMap.keys()).sort((a, b) => b - a);
-          for (const y of sortedY) {
-            collectedLines.push(lineMap.get(y)!.join(" "));
-          }
-        }
-
-        const parsed = parsePdfLinesToImportItems(collectedLines);
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const extractedLines = extractReadableLinesFromPdfBytes(bytes);
+        const parsed = parsePdfLinesToImportItems(extractedLines);
         setImportRows(parsed);
         setImportStatus(
           parsed.length > 0
-            ? `Ditemukan ${parsed.length} baris karyawan & jadwal dari PDF (${doc.numPages} halaman).`
-            : "Teks PDF terbaca, tetapi belum ada baris jadwal yang cocok. Periksa format nama & shift (Pagi/Siang/Malam atau 07:00/15:00/23:00)."
+            ? `Ditemukan ${parsed.length} baris karyawan & jadwal dari PDF.`
+            : "Teks PDF terkompresi/hasil scan tidak terbaca langsung tanpa parser PDF; gunakan file .csv atau teks PDF standar."
         );
       } else {
-        setImportStatus("Format tidak didukung. Gunakan file .xlsx, .xls, .csv, atau .pdf.");
+        setImportStatus("Gunakan file .csv, .txt, atau .pdf.");
       }
     } catch (err) {
       setImportStatus(
-        `Gagal membaca file: ${err instanceof Error ? err.message : "Error tidak diketahui"}`
+        `Gagal membaca file: ${
+          err instanceof Error ? err.message : "Error tidak diketahui"
+        }`
       );
     } finally {
       setIsImporting(false);
@@ -1187,13 +1273,14 @@ export default function JibbleDashboardApp() {
       for (const row of importRows) {
         const existing = enrichedEmployees.find(
           (emp) =>
-            emp.emp_code.trim().toLowerCase() === row.emp_code.trim().toLowerCase() ||
-            emp.full_name.trim().toLowerCase() === row.full_name.trim().toLowerCase()
+            emp.emp_code.trim().toLowerCase() ===
+              row.emp_code.trim().toLowerCase() ||
+            emp.full_name.trim().toLowerCase() ===
+              row.full_name.trim().toLowerCase()
         );
 
-        const targetId = existing?.id;
-        if (targetId) {
-          nextShiftMap[targetId] = row.shift_id;
+        if (existing?.id) {
+          nextShiftMap[existing.id] = row.shift_id;
         }
 
         if (navigator.onLine) {
@@ -1207,7 +1294,8 @@ export default function JibbleDashboardApp() {
                 emp_code: existing?.emp_code || row.emp_code,
                 full_name: row.full_name,
                 role: existing?.role || row.role,
-                department: row.department || existing?.department || "Operasional",
+                department:
+                  row.department || existing?.department || "Operasional",
                 pin_code: existing?.pin_code || row.pin_code,
                 hourly_rate: existing?.hourly_rate || row.hourly_rate,
                 shift_id: row.shift_id,
@@ -1232,7 +1320,10 @@ export default function JibbleDashboardApp() {
       if (navigator.onLine) {
         await fetchBootstrapData();
       }
-      showToast("ok", `${savedCount} data karyawan & jadwal shift berhasil diproses!`);
+      showToast(
+        "ok",
+        `${savedCount} data karyawan & jadwal shift berhasil diproses!`
+      );
       setImportRows([]);
       setImportStatus(`Selesai memproses ${savedCount} baris.`);
     } finally {
@@ -1356,11 +1447,14 @@ export default function JibbleDashboardApp() {
                   <div>
                     <div className="font-bold text-sm">{emp.full_name}</div>
                     <div className="text-xs text-slate-500">
-                      {emp.emp_code} • {emp.role} • {emp.shift_name} ({emp.shift_start_time})
+                      {emp.emp_code} • {emp.role} • {emp.shift_name} (
+                      {emp.shift_start_time})
                     </div>
                   </div>
                   {Number(selectedEmpId) === Number(emp.id) && (
-                    <span className="text-xs font-bold text-orange-600">Aktif</span>
+                    <span className="text-xs font-bold text-orange-600">
+                      Aktif
+                    </span>
                   )}
                 </button>
               ))}
@@ -1523,13 +1617,18 @@ export default function JibbleDashboardApp() {
                         <div className="flex-1 flex items-center h-full relative">
                           <div className="absolute inset-y-0 left-0 right-12 flex justify-between pointer-events-none">
                             {weeklyChartData.ticks.map((t) => (
-                              <div key={t} className="w-px h-full bg-slate-100" />
+                              <div
+                                key={t}
+                                className="w-px h-full bg-slate-100"
+                              />
                             ))}
                           </div>
                           {bar.workSeconds > 0 && (
                             <div className="relative z-10 flex items-center w-full pr-12">
                               <div
-                                style={{ width: `${Math.max(widthPct, 4)}%` }}
+                                style={{
+                                  width: `${Math.max(widthPct, 4)}%`,
+                                }}
                                 className="h-7 bg-[#00C805] rounded-r-[3px]"
                               />
                               <span className="ml-2.5 text-xs font-medium text-slate-600 whitespace-nowrap">
@@ -1573,7 +1672,8 @@ export default function JibbleDashboardApp() {
                   <div>
                     <div className="font-bold text-sm">{emp.full_name}</div>
                     <div className="text-xs text-slate-500">
-                      {emp.department} • {emp.shift_name} ({emp.shift_start_time}) •{" "}
+                      {emp.department} • {emp.shift_name} (
+                      {emp.shift_start_time}) •{" "}
                       {firstIn
                         ? `Masuk ${formatTimeWIB(firstIn.punched_at)}`
                         : "Belum masuk"}
@@ -1610,8 +1710,8 @@ export default function JibbleDashboardApp() {
               <div className="flex items-center justify-between text-left border-b border-slate-100 pb-3">
                 <div>
                   <div className="text-xs text-slate-400 font-semibold">
-                    {activeEmployee.emp_code} • {activeEmployee.shift_name} (Masuk{" "}
-                    {activeEmployee.shift_start_time})
+                    {activeEmployee.emp_code} • {activeEmployee.shift_name}{" "}
+                    (Masuk {activeEmployee.shift_start_time})
                   </div>
                   <div className="font-bold text-base">
                     {activeEmployee.full_name}
@@ -1693,7 +1793,8 @@ export default function JibbleDashboardApp() {
               <div className="text-left space-y-2 bg-slate-50 rounded-xl p-3 border border-slate-100">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-semibold text-slate-600 flex items-center gap-1">
-                    <QrCode className="w-3.5 h-3.5 text-emerald-600" /> Scan QR Kantor
+                    <QrCode className="w-3.5 h-3.5 text-emerald-600" /> Scan QR
+                    Kantor
                   </span>
                   {!qrScanActive ? (
                     <button
@@ -2111,7 +2212,7 @@ export default function JibbleDashboardApp() {
                     Pengaturan Admin, Shift & Import Massal
                   </div>
                   <div className="text-xs text-slate-500">
-                    Shift Pagi/Siang/Malam, Import PDF/XLSX, QR & GPS
+                    Shift Pagi/Siang/Malam, Import PDF/CSV, QR & GPS
                   </div>
                 </div>
               </div>
@@ -2180,7 +2281,8 @@ export default function JibbleDashboardApp() {
                   {kioskEmployee.full_name}
                 </div>
                 <div className="text-xs text-slate-300">
-                  {kioskEmployee.shift_name} • Masuk {kioskEmployee.shift_start_time}
+                  {kioskEmployee.shift_name} • Masuk{" "}
+                  {kioskEmployee.shift_start_time}
                 </div>
                 <div className="w-36 h-36 mx-auto rounded-2xl overflow-hidden bg-black border-2 border-orange-500">
                   <video
@@ -2236,7 +2338,9 @@ export default function JibbleDashboardApp() {
                   key={sp.id}
                   className="p-2.5 rounded-xl bg-slate-50 border border-slate-200/80"
                 >
-                  <div className="text-xs font-bold text-slate-800">{sp.name}</div>
+                  <div className="text-xs font-bold text-slate-800">
+                    {sp.name}
+                  </div>
                   <div className="text-sm font-mono font-extrabold text-[#00C805] mt-0.5">
                     {sp.startTime}
                   </div>
@@ -2248,7 +2352,7 @@ export default function JibbleDashboardApp() {
           <div className="bg-white rounded-2xl p-4 border border-slate-100 space-y-3">
             <div className="flex items-center justify-between">
               <h3 className="font-bold text-sm">
-                Import Massal Karyawan & Jadwal (.xlsx / .pdf)
+                Import Massal Karyawan & Jadwal (.csv / .txt / .pdf)
               </h3>
               <button
                 onClick={() => fileInputRef.current?.click()}
@@ -2256,20 +2360,19 @@ export default function JibbleDashboardApp() {
                 className="px-3 py-1.5 rounded-xl bg-emerald-600 text-white text-xs font-bold flex items-center gap-1.5"
               >
                 <Upload className="w-3.5 h-3.5" />
-                {isImporting ? "Memproses..." : "Pilih File PDF / XLSX"}
+                {isImporting ? "Memproses..." : "Pilih File"}
               </button>
               <input
                 ref={fileInputRef}
                 type="file"
-                accept=".xlsx,.xls,.csv,.pdf"
+                accept=".csv,.txt,.pdf,.xlsx,.xls"
                 onChange={handleImportFileChange}
                 className="hidden"
               />
             </div>
             <p className="text-[11px] text-slate-500">
-              Kolom Excel/CSV yang didukung: <b>emp_code / id_karyawan</b>,{" "}
-              <b>full_name / nama</b>, <b>department</b>, <b>pin_code</b>,{" "}
-              <b>shift</b> (Shift Pagi 07:00, Shift Siang 15:00, Shift Malam 23:00).
+              Format CSV/Teks: <b>emp_code,full_name,shift,department,pin_code</b>{" "}
+              (contoh: <code>KRY-005,Andi,Shift Siang,Operasional,3333</code>).
             </p>
             {importStatus && (
               <div className="text-xs font-medium text-slate-700 bg-slate-50 p-2.5 rounded-xl border border-slate-100">
@@ -2289,7 +2392,9 @@ export default function JibbleDashboardApp() {
                         <span className="text-slate-500">({item.emp_code})</span>
                         <div className="text-[11px] text-slate-600">
                           {item.department} • PIN: {item.pin_code}
-                          {item.schedule_date ? ` • Tgl: ${item.schedule_date}` : ""}
+                          {item.schedule_date
+                            ? ` • Tgl: ${item.schedule_date}`
+                            : ""}
                         </div>
                       </div>
                       <span className="px-2 py-0.5 rounded-full bg-white border font-bold text-[11px] text-emerald-700">
@@ -2506,7 +2611,11 @@ export default function JibbleDashboardApp() {
                   {e.role !== "ADMIN" && (
                     <button
                       onClick={() =>
-                        callManageApi("DELETE_EMPLOYEE", { id: e.id }, "Dihapus")
+                        callManageApi(
+                          "DELETE_EMPLOYEE",
+                          { id: e.id },
+                          "Dihapus"
+                        )
                       }
                       className="text-rose-600 font-bold"
                     >
